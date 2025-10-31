@@ -1,0 +1,192 @@
+!pip install kagglehub tensorflow matplotlib
+import kagglehub
+import os
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import shutil
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from google.colab import files
+
+# 1. Download Dataset & Define Path
+path = kagglehub.dataset_download("habibaaymanelsaid/plant-seedlings-dataset")
+print("✅ Dataset downloaded at:", path)
+
+def find_data_folder(base_path):
+    """Recursively find the folder containing plant species subfolders"""
+    for root, dirs, files in os.walk(base_path):
+        if any('plant' in dir_name.lower() or 'seed' in dir_name.lower() for dir_name in dirs):
+            for dir_name in dirs:
+                if 'plant' in dir_name.lower() or 'seed' in dir_name.lower():
+                    potential_path = os.path.join(root, dir_name)
+                    subfolders = [f for f in os.listdir(potential_path)
+                                  if os.path.isdir(os.path.join(potential_path, f))]
+                    if len(subfolders) > 5:
+                        return potential_path
+    return base_path
+
+data_path = os.path.join(path, "plant-seedlings-dataset")
+print(f"🎯 Using data path: {data_path}")
+
+# ------------------------------
+# 2. Pipeline for Growth Stage Classification
+# ------------------------------
+class PlantGrowthDataPipeline:
+    def __init__(self, target_size=(64, 64), batch_size=32):
+        self.target_size = target_size
+        self.batch_size = batch_size
+        self.stages = ["germination", "sprout", "early_stage", "mature_stage"]
+
+    def create_growth_stage_structure(self, original_path):
+        print("🔄 Reorganizing dataset into growth stages...")
+        base_dir = "plant_growth_dataset"
+        for split in ["train", "val", "test"]:
+            for stage in self.stages:
+                os.makedirs(os.path.join(base_dir, split, stage), exist_ok=True)
+
+        all_images = []
+        image_sources = []
+
+        for species in os.listdir(original_path):
+            species_path = os.path.join(original_path, species)
+            if os.path.isdir(species_path):
+                for img_file in os.listdir(species_path):
+                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        img_path = os.path.join(species_path, img_file)
+                        all_images.append(img_path)
+                        image_sources.append(species)
+
+        print(f"📷 Found {len(all_images)} total images")
+
+        train_files, test_files = train_test_split(all_images, test_size=0.3, random_state=42)
+        val_files, test_files = train_test_split(test_files, test_size=0.5, random_state=42)
+
+        def copy_to_stage(file_list, split_name, stage="sprout"):
+            for img_path in file_list:
+                filename = os.path.basename(img_path)
+                species = [s for i, s in enumerate(image_sources) if all_images[i] == img_path][0]
+                new_filename = f"{species}_{filename}"
+                shutil.copy(img_path, os.path.join(base_dir, split_name, stage, new_filename))
+
+        copy_to_stage(train_files, "train", "sprout")
+        copy_to_stage(val_files, "val", "sprout")
+        copy_to_stage(test_files, "test", "sprout")
+
+        print("✅ Dataset reorganized! All images classified as 'sprout' stage")
+        return base_dir
+
+    def create_data_generators(self, dataset_path):
+        train_datagen = ImageDataGenerator(
+            rescale=1./255,
+            rotation_range=20,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            shear_range=0.2,
+            zoom_range=0.2,
+            horizontal_flip=True,
+            fill_mode='nearest'
+        )
+
+        val_datagen = ImageDataGenerator(rescale=1./255)
+
+        train_generator = train_datagen.flow_from_directory(
+            os.path.join(dataset_path, "train"),
+            target_size=self.target_size,
+            batch_size=self.batch_size,
+            class_mode='categorical'
+        )
+
+        val_generator = val_datagen.flow_from_directory(
+            os.path.join(dataset_path, "val"),
+            target_size=self.target_size,
+            batch_size=self.batch_size,
+            class_mode='categorical'
+        )
+
+        print("✅ Data generators created")
+        print("📊 Class mapping:", train_generator.class_indices)
+        return train_generator, val_generator
+
+# ------------------------------
+# 3. Execute the Pipeline
+# ------------------------------
+pipeline = PlantGrowthDataPipeline()
+new_dataset_path = pipeline.create_growth_stage_structure(data_path)
+train_gen, val_gen = pipeline.create_data_generators(new_dataset_path)
+
+# ------------------------------
+# 4. Train Model
+# ------------------------------
+print("🧠 Training model for sprout detection...")
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Conv2D(16, (3,3), activation='relu', input_shape=(64,64,3)),
+    tf.keras.layers.MaxPooling2D(2,2),
+    tf.keras.layers.Conv2D(32, (3,3), activation='relu'),
+    tf.keras.layers.MaxPooling2D(2,2),
+    tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
+    tf.keras.layers.MaxPooling2D(2,2),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dropout(0.5),
+    tf.keras.layers.Dense(train_gen.num_classes, activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+history = model.fit(
+    train_gen,
+    epochs=10,
+    validation_data=val_gen,
+    steps_per_epoch=len(train_gen),
+    validation_steps=len(val_gen)
+)
+
+# ------------------------------
+# 5. Save Model
+# ------------------------------
+model.save("sprout_detector.h5")
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+tflite_model = converter.convert()
+with open("sprout_detector.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print("✅ Model saved as sprout_detector.tflite")
+
+# ------------------------------
+# 6. Plot & Download Training Graphs
+# ------------------------------
+def plot_and_save(history):
+    # Accuracy
+    plt.figure(figsize=(10,4))
+    plt.plot(history.history['accuracy'], label='Train Accuracy', marker='o')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy', marker='o')
+    plt.title("Model Accuracy vs Epochs")
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("accuracy_plot.png", dpi=300)
+    plt.show()
+
+    # Loss
+    plt.figure(figsize=(10,4))
+    plt.plot(history.history['loss'], label='Train Loss', marker='o')
+    plt.plot(history.history['val_loss'], label='Validation Loss', marker='o')
+    plt.title("Model Loss vs Epochs")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_plot.png", dpi=300)
+    plt.show()
+
+    # Download plots (Colab)
+    files.download("accuracy_plot.png")
+    files.download("loss_plot.png")
+
+plot_and_save(history)
+
+print("🎯 Training graphs saved and ready for download!")
